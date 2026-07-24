@@ -1,0 +1,37 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.backends._legacy:_Backend"
+
+[project]
+name = "chinatravel-tpc"
+version = "1.0.0"
+description = "TPCAgent: A Neuro-Symbolic Travel Planning Agent for Chinese Cities"
+readme = "README.md"
+license = {text = "MIT"}
+authors = [
+    {name = "YZ1553927"},
+]
+requires-python = ">=3.9"
+dependencies = [
+    "pandas",
+    "numpy",
+    "geopy>=2.0",
+    "transformers",
+    "torch",
+    "openai",
+    "tiktoken",
+    "jsonschema",
+    "json_repair",
+    "fuzzywuzzy",
+]
+
+[project.optional-dependencies]
+dev = [
+    "datasets",
+]
+
+[tool.setuptools.packages.find]
+include = ["tpc_agent", "tpc_agent.*", "chinatravel", "chinatravel.*"]
+
+[tool.setuptools.package-data]
+chinatravel = ["**/*.json", "**/*.csv", "**/*.txt"]

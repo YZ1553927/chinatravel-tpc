@@ -1,0 +1,32 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Runtime
+logs/
+cache/
+*.log
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Environment
+.env
+.venv/
+venv/
+
+# Database (large data files - symlink or download separately)
+database/
+
+# Model weights (too large for GitHub)
+local_llm/
+*.safetensors
+*.bin
+*.pth

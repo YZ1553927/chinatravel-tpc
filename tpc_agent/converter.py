@@ -1,36 +1,70 @@
 """
 SimpleTravelConverter - Natural Language to Structured JSON Parser.
 
-Parses natural language travel queries into structured JSON format
-using a local Qwen language model.
+Parses natural language travel queries into structured JSON format.
+Supports both API backends and local transformers models.
 
 Author: YZ1553927
 License: MIT
 """
 
 import json
+import os
 import re
 import time
 from typing import Dict, Any, List, Optional
-import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer
+
+# change.py 有两种被导入的方式：tpc_llm.py 会把本目录加进 sys.path 后 `import change`，
+# 也可能作为 agent.tpc_agent.change 被包内导入。这里兜底保证 _config 一定能找到。
+try:
+    from tpc_agent._config import load_dotenv
+except ImportError:  # pragma: no cover
+    import sys as _sys
+
+    _sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    from tpc_agent._config import load_dotenv
+
+# torch / transformers 只在真正加载本地模型时才需要。
+# 走 API 后端（SimpleTravelConverterAPI）时不导入，省去数 GB 的加载开销。
+torch = None
+AutoModelForCausalLM = None
+AutoTokenizer = None
+
+
+def _ensure_local_deps():
+    """延迟导入本地推理依赖，仅在加载 transformers 模型时调用一次。"""
+    global torch, AutoModelForCausalLM, AutoTokenizer
+    if torch is None:
+        import torch as _torch
+        from transformers import (
+            AutoModelForCausalLM as _auto_model,
+            AutoTokenizer as _auto_tok,
+        )
+
+        torch, AutoModelForCausalLM, AutoTokenizer = _torch, _auto_model, _auto_tok
 
 
 class SimpleTravelConverter:
-    def __init__(self, model_path: str):
+    def __init__(self, model_path: str = None, load_model: bool = True):
         """
         简化版旅行需求转换器 - 只提取核心信息
 
         Args:
             model_path: 模型路径
+            load_model: 是否加载本地 transformers 模型。
+                        子类走 API 时传 False，跳过加载但仍复用全部后处理逻辑。
         """
         self.model_path = model_path
         self.model = None
         self.tokenizer = None
-        self._check_environment()
-        self._load_model_optimized()
+        # 供上层日志/健康检查使用；API 子类会覆盖成 "api:<model>"
+        self.name = f"local:{os.path.basename(model_path)}" if model_path else "local"
+        if load_model:
+            self._check_environment()
+            self._load_model_optimized()
 
-        # 简化输出格式 - 只保留核心字段
+        # 输出格式：必须与 _create_simple_prompt 里给模型的字段清单逐字一致，
+        # 也与 get_pretty_data 读取的键名逐字一致。三者错位会导致 KeyError 或静默丢字段。
         self.output_template = {
             # 基础信息
             "start_city": "",
@@ -40,24 +74,31 @@ class SimpleTravelConverter:
 
             # 预算信息
             "budget_total": "",
+            "budget_accommodation": "",
+            "budget_meal": "",
+            "budget_attraction": "",
+            "budget_inter_transport": "",
+            "budget_inner_transport": "",
 
             # 交通偏好
-            "intercity_transport_go": [],  # train/airplane
-            "intercity_transport_back": [],  # train/airplane
-            "transport_mode_unwanted": [],  # walk/taxi/metro
+            "intercity_transport": [],       # train/airplane
+            "transport_mode_wanted": [],     # walk/taxi/metro
+            "transport_mode_unwanted": [],   # walk/taxi/metro
 
             # 住宿偏好
             "accommodation_wanted": [],
-            "room_type": "",  # 单床房/双床房
+            "accommodation_type_wanted": [],
+            "room_type": "",
 
             # 景点偏好
             "attraction_wanted": [],
+            "attraction_type_wanted": [],
 
             # 餐饮偏好
             "restaurant_wanted": [],
-            "food_preference": [],
+            "food_preferences": [],
             "dietary_restrictions": [],
-            "cuisiine_types": [],
+            "cuisine_types": [],
 
             # 其他重要需求
             "special_requirements": []
@@ -65,6 +106,7 @@ class SimpleTravelConverter:
 
     def _check_environment(self):
         """检查运行环境"""
+        _ensure_local_deps()
         print("=== 环境诊断 ===")
         print(f"PyTorch版本: {torch.__version__}")
         print(f"CUDA可用: {torch.cuda.is_available()}")
@@ -79,6 +121,7 @@ class SimpleTravelConverter:
 
     def _load_model_optimized(self):
         """优化加载模型和tokenizer"""
+        _ensure_local_deps()
         try:
             print("正在优化加载模型...")
 
@@ -319,8 +362,10 @@ class SimpleTravelConverter:
             return False
 
         # 检查是否有非空字段
+        # 注意：result 可能含模板外的键（模型多输出的字段），必须用 .get 兜底，
+        # 否则模型一旦正确提取到字段就会抛 KeyError，被上层吞掉后返回空模板。
         for key, value in result.items():
-            if value and value != self.output_template[key]:
+            if value and value != self.output_template.get(key):
                 return True
 
         return False
@@ -533,10 +578,86 @@ class SimpleTravelConverter:
 
         return pretty_data
 
+class SimpleTravelConverterAPI(SimpleTravelConverter):
+    """
+    用 OpenAI 兼容 API 替代本地 transformers 推理。
+
+    继承自 SimpleTravelConverter，只覆盖"跑模型"这一步，
+    完整复用父类的 prompt 构造 / JSON 解析 / 字段规范化 / get_pretty_data，
+    因此换后端不会改变下游 tpc_llm.py 看到的数据结构。
+
+    支持任何 OpenAI 兼容端点：DeepSeek / OpenAI / 通义 / 本地 vLLM 等。
+
+    用法:
+        converter = SimpleTravelConverterAPI()                      # 默认 DeepSeek
+        converter = SimpleTravelConverterAPI(model="gpt-4o",
+                                             base_url="https://api.openai.com/v1")
+    """
+
+    def __init__(
+        self,
+        model: str = "deepseek-chat",
+        api_key: Optional[str] = None,
+        base_url: str = "https://api.deepseek.com",
+        timeout: float = 60.0,
+    ):
+        # load_model=False：跳过 transformers 加载，但仍建好 output_template
+        super().__init__(model_path=None, load_model=False)
+
+        load_dotenv()
+
+        from openai import OpenAI
+
+        # 厂商无关：TPC_API_KEY 优先，其次各厂商常见变量名
+        api_key = (
+            api_key
+            or os.environ.get("TPC_API_KEY")
+            or os.environ.get("DEEPSEEK_API_KEY")
+            or os.environ.get("ZHIPUAI_API_KEY")
+            or os.environ.get("GLM_API_KEY")
+            or os.environ.get("DASHSCOPE_API_KEY")
+            or os.environ.get("OPENAI_API_KEY")
+        )
+        if not api_key:
+            raise RuntimeError(
+                "未找到 API key。请设置 TPC_API_KEY（或 DEEPSEEK_API_KEY / ZHIPUAI_API_KEY / "
+                "DASHSCOPE_API_KEY / OPENAI_API_KEY 中任意一个）。"
+            )
+
+        self.client = OpenAI(api_key=api_key, base_url=base_url, timeout=timeout)
+        self.api_model = model
+        self.name = f"api:{model}"
+
+    def convert_fast(self, user_input: str) -> Dict[str, Any]:
+        """调用 API 完成一次抽取。签名与父类一致，便于 convert_with_fallback 复用。"""
+        total_start = time.time()
+        prompt = self._create_simple_prompt(user_input)
+
+        try:
+            resp = self.client.chat.completions.create(
+                model=self.api_model,
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.1,
+                max_tokens=1300,
+            )
+            generated_text = (resp.choices[0].message.content or "").strip()
+            print(f"API 耗时: {time.time() - total_start:.2f}秒")
+            print(f"生成内容预览: {generated_text[:120]}...")
+
+            # _extract_json_fast 内部已做花括号配对、尾逗号清理、模板字段补齐
+            return self._extract_json_fast(generated_text)
+
+        except Exception as e:
+            print(f"API 调用出错: {e}")
+            return self.output_template.copy()
+
+
 # 使用示例
 if __name__ == "__main__":
-    # 初始化转换器
-    converter = SimpleTravelConverter("/home/yz/chinatravel/local_llm/Qwen3-4B/Qwen/Qwen3-4B")
+    # 走 API（需要 DEEPSEEK_API_KEY）
+    converter = SimpleTravelConverterAPI()
+    # 或走本地模型：
+    # converter = SimpleTravelConverter("chinatravel/local_llm/Qwen3-4B")
 
     # 测试输入
     test_inputs = [

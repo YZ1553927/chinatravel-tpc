@@ -22,6 +22,14 @@ import re
 import ast
 from geopy.distance import geodesic
 
+sys.path.append("./../../../")
+project_root_path = os.path.dirname(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+)
+
+if project_root_path not in sys.path:
+    sys.path.insert(0, project_root_path)
+
 from chinatravel.agent.base import AbstractAgent, BaseAgent
 from tpc_agent.utils import (
     time_compare_if_earlier_equal,
@@ -31,6 +39,7 @@ from tpc_agent.utils import (
     TimeOutError,
 )
 
+# from chinatravel.eval.utils import load_json_file, validate_json, save_json_file
 from chinatravel.data.load_datasets import load_json_file, save_json_file
 from chinatravel.agent.utils import Logger
 from chinatravel.symbol_verification.commonsense_constraint import (
@@ -1356,9 +1365,12 @@ class TPCAgent(BaseAgent):
                         flag, _ = self.check_constraint(plan, temp_cons)
                     if not flag:
                         for _, poi_sel in must_type_candidates.iterrows():
+                            # 同样不按菜系排除候选。
+                            # 这里尤其不能排除：must_type_candidates 混进了「指定餐厅名」
+                            # 的候选（见上方 pd.concat([must_candidates, must_type])），
+                            # 那些餐厅的菜系只要已经吃过，就会被误跳过，
+                            # 导致「必须去某餐厅」的需求永远无法通过这条路径满足。
                             if poi_sel["name"] in self.restaurant_names_visiting:
-                                continue
-                            if poi_sel["cuisine"] in self.food_type_visiting:
                                 continue
                             # 临时添加至计划中，更新当前地点和时间
                             transports_ranking = self.innercity_transports_ranking
@@ -1526,9 +1538,12 @@ class TPCAgent(BaseAgent):
                                 self.restaurant_names_visiting.pop()
 
                     for _, poi_sel in top_candidates.iterrows():
+                        # 只排除「同一家餐厅」，不排除「同一菜系」。
+                        # 与景点处的 spot_type_visiting 是同一个模式：类型排除是
+                        # tpc_agent 分支自己加的，上游 nesy_agent 里 food_type_visiting
+                        # 只 append/pop、从不参与过滤。沙盒约束只要求不重复餐厅，
+                        # 菜系排除会随行程推进逐步封死候选（景点那边已实测 11→33 个）。
                         if poi_sel["name"] in self.restaurant_names_visiting:
-                            continue
-                        if poi_sel["cuisine"] in self.food_type_visiting:
                             continue
                         # 临时添加至计划中，更新当前地点和时间
                         transports_ranking = self.innercity_transports_ranking
@@ -1851,6 +1866,10 @@ class TPCAgent(BaseAgent):
                             if not must_attr.empty:
                                 must_type_candidates = pd.concat([must_candidates, must_attr]).drop_duplicates()
 
+                    # 排序保持价格/距离为准 —— 不要把"类型新鲜度"提到排序之前。
+                    # 踩过的坑：把没去过的类型提到队首后，23 个「自然风光」景点
+                    # （全在密云/怀柔/延庆等远郊）全部插队，光路上就要十几小时，
+                    # 到站全部闭馆（arrival time 甚至出现 26:49），当天一个也排不进去。
                     top_candidates = candidate_attr_ranked.iloc[
                                      :min(n, len(candidate_attr_ranked))].copy()
 
@@ -2228,9 +2247,15 @@ class TPCAgent(BaseAgent):
                                 self.attraction_names_visiting.pop()
 
                     for _, poi_sel in top_candidates.iterrows():
+                        # 只排除「同一个景点」，不排除「同一类型」。
+                        #
+                        # 原代码这里还有一条 if poi_sel["type"] in self.spot_type_visiting: continue。
+                        # 北京只有 12 种景点类型，一天逛 7 个就用掉 7 种，两三天后
+                        # 剩余候选被整类跳过，循环零次迭代，直接掉进"去酒店"分支 ——
+                        # 表现为「上午一个景点+午饭，下午 1 点回酒店待到 24 点」。
+                        # 沙盒约束只要求不重复景点；上游 nesy_agent 也只挡景点不挡类型
+                        # （spot_type_visiting 在那里只记录、不过滤）。
                         if poi_sel["name"] in self.attraction_names_visiting:
-                            continue
-                        if poi_sel["type"] in self.spot_type_visiting:
                             continue
                         print(f"lookahead to add attraction, candidate: {poi_sel['name']}")
                         # 临时添加至计划中，更新当前地点和时间

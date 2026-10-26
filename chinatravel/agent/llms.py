@@ -16,6 +16,37 @@ import sys
 import os
 
 
+# 本文件位于 <部署根>/chinatravel/agent/llms.py
+# 向上三级 = <部署根>，使 <部署根>/chinatravel/local_llm/<model> 可解析
+project_root_path = os.path.dirname(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+)
+
+
+if project_root_path not in sys.path:
+    sys.path.insert(0, project_root_path)
+
+
+def _resolve_api_key():
+    """解析 API key，兼容各家厂商常用的环境变量名。
+
+    优先级：TPC_API_KEY > 厂商专用变量 > OPENAI_API_KEY。
+    用户只要设置其中任意一个，DeepSeek / 智谱 / 通义 / OpenAI 都能直接用。
+    """
+    for var in (
+        "TPC_API_KEY",
+        "DEEPSEEK_API_KEY",
+        "ZHIPUAI_API_KEY",
+        "GLM_API_KEY",
+        "DASHSCOPE_API_KEY",
+        "OPENAI_API_KEY",
+    ):
+        value = os.environ.get(var)
+        if value:
+            return value
+    return None
+
+
 def chat_template(messages):
     """
     将 messages 列表转成符合 Chat 模板格式的字符串
@@ -69,29 +100,42 @@ class Deepseek(AbstractLLM):
         super().__init__()
         self.llm = OpenAI(
             base_url="https://api.deepseek.com",
+            api_key=_resolve_api_key(),
         )
         self.path = os.path.join(
             project_root_path, "chinatravel", "local_llm", "deepseek_v3_tokenizer"
         )
         self.name = "DeepSeek-V3"
 
-        self.tokenizer = AutoTokenizer.from_pretrained(self.path)
+        # tokenizer 只用于统计 token 数，缺失不应阻止模型使用。
+        # 之前这里直接 from_pretrained，仓库里没放 tokenizer 时会直接抛异常，
+        # 导致 init_llm("deepseek") 完全不可用。
+        self.tokenizer = None
+        if os.path.isdir(self.path):
+            try:
+                self.tokenizer = AutoTokenizer.from_pretrained(self.path)
+            except Exception as e:
+                print(f"⚠️ 加载 DeepSeek tokenizer 失败，跳过 token 计数: {e}")
+        else:
+            print(f"⚠️ 未找到 DeepSeek tokenizer（{self.path}），跳过 token 计数。")
+            print("   如需精确计数：把 deepseek_v3_tokenizer 放到 chinatravel/local_llm/")
 
     def _send_request(self, messages, kwargs):
 
-        text = self.tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-        input_tokens = self.tokenizer(text)["input_ids"]
-
-        self.input_token_count += len(input_tokens)
-        self.input_token_maxx = max(self.input_token_maxx, len(input_tokens))
+        if self.tokenizer is not None:
+            text = self.tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+            input_tokens = self.tokenizer(text)["input_ids"]
+            self.input_token_count += len(input_tokens)
+            self.input_token_maxx = max(self.input_token_maxx, len(input_tokens))
 
         res_str = (
             self.llm.chat.completions.create(messages=messages, **kwargs)
             .choices[0]
             .message.content
         )
-        output_tokens = self.tokenizer(res_str)["input_ids"]
-        self.output_token_count += len(output_tokens)
+        if self.tokenizer is not None:
+            output_tokens = self.tokenizer(res_str)["input_ids"]
+            self.output_token_count += len(output_tokens)
 
         res_str = res_str.strip()
         return res_str
@@ -122,6 +166,7 @@ class GLM4Plus(AbstractLLM):
         super().__init__()
         self.llm = OpenAI(
             base_url="https://open.bigmodel.cn/api/paas/v4",
+            api_key=_resolve_api_key(),
         )
         self.name = "GLM4Plus"
 
@@ -155,7 +200,7 @@ class GLM4Plus(AbstractLLM):
 class GPT4o(AbstractLLM):
     def __init__(self):
         super().__init__()
-        self.llm = OpenAI()
+        self.llm = OpenAI(api_key=_resolve_api_key())
         self.name = "GPT4o"
         self.tokenizer = tiktoken.encoding_for_model("gpt-4o")
 

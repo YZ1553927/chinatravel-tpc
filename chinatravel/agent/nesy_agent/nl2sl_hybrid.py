@@ -205,7 +205,12 @@ The original code block is:
 )
 
 
-def load_example_plans(example_plans_dir="/home/yz/chinatravel/agent/nesy_agent/plan_for_check"):
+def load_example_plans(example_plans_dir=None):
+    # 默认取与本文件同级的 plan_for_check/，避免写死部署机绝对路径
+    if example_plans_dir is None:
+        example_plans_dir = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), "plan_for_check"
+        )
     plan_for_test = {}
     plan_files = os.listdir(example_plans_dir)
     plan_files = [plan_file for plan_file in plan_files if plan_file.endswith(".json")]

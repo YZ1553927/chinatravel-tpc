@@ -3,6 +3,7 @@ TPCLLM - Natural Language to Symbolic Constraint Translator.
 
 Translates natural language travel queries into executable Python
 constraint code using LLM-based translation with reflection.
+Supports both API backends (DeepSeek / Zhipu / OpenAI-compatible) and local models.
 
 Author: YZ1553927
 License: MIT
@@ -12,25 +13,107 @@ import re
 import json
 from typing import Dict, List, Any
 import time
+import os
+import sys
+
+# 添加项目路径以便导入 AbstractLLM
+project_root_path = os.path.dirname(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+)
+if project_root_path not in sys.path:
+    sys.path.append(project_root_path)
+
+llm_change_path = os.path.dirname(os.path.abspath(__file__))
+if llm_change_path not in sys.path:
+    sys.path.append(llm_change_path)
 
 from chinatravel.agent.llms import AbstractLLM
-from tpc_agent.converter import SimpleTravelConverter
+from tpc_agent.converter import SimpleTravelConverter, SimpleTravelConverterAPI
+
+
+from tpc_agent._config import load_dotenv as _load_dotenv
+
+# 城市 → 真实 POI 名录的缓存，避免每次抽取都重读 CSV
+_POI_NAME_CACHE = {}
+
+
+def _candidate_model_paths():
+    """本地模型候选路径，按优先级排列，兼容发布版与开发版两种布局。
+
+    历史上代码写死了 <tpc_agent>/Qwen3-4B/Qwen/Qwen3-4B（竞赛要求模型随代码提交），
+    但 modelscope 下载时文件是平铺在 local_llm/Qwen3-4B/ 下的，
+    所以这里把几种布局都列上，避免加载失败后静默降级成 travel_converter=None。
+
+    如果要走 DeepSeek 等 API，这几条路径都找不到也没关系 —— 会优先用 API 后端。
+    """
+    current_dir = os.path.dirname(os.path.abspath(__file__))   # <repo>/tpc_agent
+    repo_root = os.path.dirname(current_dir)                   # <repo>
+    outer = os.path.dirname(repo_root)                         # 开发版外层
+
+    cands = [
+        os.path.join(current_dir, "Qwen3-4B", "Qwen", "Qwen3-4B"),  # 竞赛打包布局
+        os.path.join(current_dir, "Qwen3-4B"),                       # 随代码提交的平铺布局
+    ]
+    for root in (repo_root, outer):
+        cands.append(os.path.join(root, "chinatravel", "local_llm", "Qwen3-4B"))
+        cands.append(os.path.join(root, "local_llm", "Qwen3-4B"))
+    return cands
+
 
 class TPCLLM(AbstractLLM):
-    def __init__(self, model_path=None):
-        """初始化TPCLLM - 与TPC Agent对接的版本"""
+    def __init__(self, model_path=None, backend=None):
+        """初始化TPCLLM - 与TPC Agent对接的版本
+
+        Args:
+            model_path: 显式指定本地模型路径，指定后强制走本地推理
+            backend:    "api" 强制走 API；"local" 强制走本地；None 自动选择
+        """
         super().__init__()
         self.name = "TPC-Algorithm"
         self.travel_converter = None
-        current_dir = os.path.dirname(os.path.abspath(__file__))
-        model_path = os.path.join(current_dir, "Qwen3-4B", "Qwen", "Qwen3-4B")
-        if model_path:
+
+        _load_dotenv()
+
+        _KEY_VARS = ("TPC_API_KEY", "DEEPSEEK_API_KEY", "ZHIPUAI_API_KEY",
+                     "GLM_API_KEY", "DASHSCOPE_API_KEY", "OPENAI_API_KEY")
+        use_api = (
+            backend == "api"
+            or (backend is None and not model_path
+                and any(os.environ.get(k) for k in _KEY_VARS))
+        )
+
+        if use_api:
             try:
-                self.travel_converter = SimpleTravelConverter(model_path)
-                print("✅ SimpleTravelConverter 初始化成功")
+                self.travel_converter = SimpleTravelConverterAPI(
+                    model=os.environ.get("TPC_API_MODEL", "deepseek-chat"),
+                    base_url=os.environ.get("TPC_API_BASE", "https://api.deepseek.com"),
+                )
+                print(f"✅ 使用 API 后端: {self.travel_converter.name}")
             except Exception as e:
-                print(f"❌ SimpleTravelConverter 初始化失败: {e}")
-                self.travel_converter = None
+                print(f"⚠️ API 后端初始化失败，回退本地模型: {e}")
+
+        candidates = [model_path] if model_path else _candidate_model_paths()
+
+        if self.travel_converter is None:
+            # 本地模型：逐个候选路径尝试
+            for path in candidates:
+                if not path or not os.path.isdir(path):
+                    continue
+                try:
+                    self.travel_converter = SimpleTravelConverter(path)
+                    print(f"✅ 本地模型加载成功: {path}")
+                    break
+                except Exception as e:
+                    print(f"⚠️ 加载失败 {path}: {e}")
+
+        if self.travel_converter is None:
+            print("❌ 无可用后端：既没有 API key，也没有找到本地模型")
+            print(f"   已尝试的路径: {[p for p in candidates if p]}")
+            print("   请设置 TPC_API_KEY，或把模型放到上述任一目录")
+
+        # ── 以下词表供约束抽取使用，无论走哪个后端都必须初始化 ──
+        # （早先版本在这里用了 return，导致走 API 时 type_mapping 等属性缺失，
+        #   报 'TPCLLM' object has no attribute 'type_mapping'）
 
         # 定义景点类型集合，用于区分名称和类型
         self.attraction_types = {
@@ -94,13 +177,23 @@ class TPCLLM(AbstractLLM):
 
 
     def nl_to_python_direct(self, natural_language=None, days=None, people_number=None,
-                            start_city=None, target_city=None):
-        """直接将自然语言转换为Python代码 - 与TPC Agent对接的版本"""
+                            start_city=None, target_city=None, structured_data=None):
+        """直接将自然语言转换为Python代码 - 与TPC Agent对接的版本
+
+        Args:
+            structured_data: 已抽取好的结果（get_pretty_data 的输出，中文键）。
+                             传入则跳过 LLM 抽取，供服务端复用同一次抽取结果，
+                             避免同一句话被调用两次模型。
+        """
 
         print("🔍 TPC-Algorithm 开始处理自然语言输入...")
 
-        # 使用 travel_converter 将自然语言转换为 structured_data
-        if natural_language and self.travel_converter:
+        if structured_data is not None:
+            # 调用方已经抽好了，直接用
+            print("📝 使用调用方提供的结构化结果，跳过 LLM 抽取")
+            if self.travel_converter:
+                self.travel_converter.print_result(structured_data)
+        elif natural_language and self.travel_converter:
             print("📝 使用 SimpleTravelConverter 转换自然语言...")
             print(f"{natural_language}")
             structured_data_old = self.travel_converter.convert_with_fallback(natural_language)
@@ -111,32 +204,28 @@ class TPCLLM(AbstractLLM):
             print(f"🎨 美化数据: {structured_data}")
 
             if not structured_data:
+                # 抽取结果为空时，只保留已知的基础事实，绝不臆造用户偏好。
+                # 旧代码在此处塞入 "大床房 / 历史景点 / 博物馆 / 火锅" 等默认值，
+                # 会给每条查询都加上用户从未提过的约束 —— 生成出的 DSL 要求
+                # 必须住大床房、必须去博物馆、必须吃火锅，直接导致 FPR 判不通过。
                 structured_data = {
                     "start_city": start_city,
                     "target_city": target_city,
                     "days": days,
                     "people_number": people_number,
-                    "城内交通": ["taxi", "metro"],
-                    "房型": "大床房",
-                    "想去的景点": ["历史景点", "博物馆"],
-                    "食物偏好": ["火锅", "本地特色美食"]
                 }
 
             # 打印转换结果用于调试
             self.travel_converter.print_result(structured_data)
         else:
-            # 如果没有自然语言或转换器不可用，创建空的 structured_data
-            print("⚠️ 无自然语言输入或转换器不可用")
+            # 没有自然语言输入，或转换器不可用（无 API key 且找不到本地模型）。
+            # 同样只保留基础事实 —— 这里臆造偏好会让"没有 LLM"退化成"错误的 LLM"。
+            print("⚠️ 无自然语言输入或转换器不可用，仅使用基础信息（不生成偏好约束）")
             structured_data = {
                 "start_city": start_city,
                 "target_city": target_city,
                 "days": days,
-                "people_number":people_number,
-                "往返交通": ["train"],
-                "城内交通": ["taxi", "train"],
-                "房型": "大床房",
-                "想去的景点": ["历史景点", "博物馆"],
-                "食物偏好": ["火锅","本地特色美食"]
+                "people_number": people_number,
             }
 
         basic_info = self._build_basic_info(structured_data, days, people_number, start_city, target_city)
@@ -214,7 +303,7 @@ class TPCLLM(AbstractLLM):
         constraints.extend(self._extract_accommodation_constraints(data))
 
         # 提取景点约束
-        constraints.extend(self._extract_attraction_constraints(data))
+        constraints.extend(self._extract_attraction_constraints(data, target_city))
 
         # 提取餐厅约束
         constraints.extend(self._extract_restaurant_constraints(data,target_city))
@@ -441,12 +530,96 @@ class TPCLLM(AbstractLLM):
 
         return constraints
 
-    def _extract_attraction_constraints(self, data):
+    # ── POI 名称对齐 ────────────────────────────────────────────────
+    # 用户口语名与沙盒真名经常对不上（说"故宫"，沙盒里叫"故宫博物院"）。
+    # 不对齐的话生成的约束形如 {"故宫"} <= attraction_name_set，永远为 False，
+    # 搜索无论怎么找都满足不了，最后只能退回兜底方案 —— 直接损失 C-LPR 和 FPR。
+    # nesy_agent 里的 ast_checker.py 有同类校验，但规则引擎这条路径没有，这里补上。
+
+    def _real_poi_names(self, city, kind="attraction"):
+        """取目标城市里真实存在的景点/餐厅名，保持数据表原始顺序（模块级缓存）。
+
+        返回 list 而非 set —— 数据表顺序本身就是"主条目在前"的线索：
+        用户说"故宫"时，候选有 故宫博物院 / 故宫珍宝馆 / 故宫钟表馆，
+        取库里最靠前的那个才符合直觉。
+        """
+        key = (city, kind)
+        if key in _POI_NAME_CACHE:
+            return _POI_NAME_CACHE[key]
+
+        names = []
+        try:
+            if kind == "attraction":
+                from chinatravel.environment.tools.attractions.apis import Attractions as _T
+            else:
+                from chinatravel.environment.tools.restaurants.apis import Restaurants as _T
+            df = _T().data.get(city)
+            if df is not None:
+                names = [str(x) for x in df["name"].tolist()]
+        except Exception as e:
+            print(f"⚠️ 读取 {city} 的{kind}名录失败，跳过名称对齐: {e}")
+
+        _POI_NAME_CACHE[key] = names
+        return names
+
+    def _align_poi_names(self, names, city, kind="attraction"):
+        """把口语名对齐到沙盒真名；找不到则原样保留并告警。"""
+        if not names or not city:
+            return names
+
+        real = self._real_poi_names(city, kind)
+        if not real:
+            return names
+        real_set = set(real)
+
+        try:
+            from fuzzywuzzy import fuzz
+            from fuzzywuzzy import process as fuzz_process
+        except Exception:
+            fuzz = fuzz_process = None
+
+        def score(a, b):
+            return fuzz.ratio(a, b) if fuzz else 0
+
+        aligned = []
+        for raw in names:
+            n = str(raw).strip()
+            if not n:
+                continue
+            if n in real_set:                  # 已经是真名
+                aligned.append(n)
+                continue
+
+            # 子串命中："故宫" ⊂ "故宫博物院"；反过来的情况也接受
+            subs = [r for r in real if n in r] or [r for r in real if r in n]
+            if subs:
+                # 相似度优先，平手时取数据表里更靠前的
+                best = sorted(subs, key=lambda r: (-score(n, r), real.index(r)))[0]
+                print(f"🔧 POI 名对齐: 「{n}」→「{best}」")
+                aligned.append(best)
+                continue
+
+            if fuzz_process:
+                cand = fuzz_process.extractOne(n, real)
+                if cand and cand[1] >= 80:
+                    print(f"🔧 POI 名模糊对齐: 「{n}」→「{cand[0]}」(相似度 {cand[1]})")
+                    aligned.append(cand[0])
+                    continue
+
+            print(f"⚠️ 沙盒 {city} 里找不到{kind}「{n}」，该约束可能无法满足")
+            aligned.append(n)
+
+        return aligned or names
+
+    def _extract_attraction_constraints(self, data, target_city=None):
         """提取景点约束"""
         constraints = []
 
         if "想去的景点" in data and data["想去的景点"]:
             attractions = [self.type_mapping.get(attr, attr) for attr in data["想去的景点"]]
+            # 先判断是类型还是具体名称，只有具体名称才需要对齐
+            if not all(attr in self.attraction_types for attr in attractions):
+                attractions = self._align_poi_names(attractions, target_city, "attraction")
 
             # 判断是景点名称还是类型
             if all(attr in self.attraction_types for attr in attractions):
